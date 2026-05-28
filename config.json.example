@@ -1,0 +1,30 @@
+{
+  "llama_binary": "/path/to/your/llama-server",
+  "workdir": "/home/user",
+  "llama_host": "127.0.0.1",
+  "llama_port": 11434,
+  "listen_addr": ":4468",
+  "allowed_flags": [
+    "spec-type",
+    "spec-draft-n-max",
+    "temp",
+    "top-p",
+    "top-k",
+    "min-p",
+    "repeat-penalty",
+    "seed",
+    "threads",
+    "batch",
+    "ubatch",
+    "ngl",
+    "c",
+    "fa",
+    "np"
+  ],
+  "allowed_env": [
+    "LLAMA_CACHE",
+    "HUGGING_FACE_HUB_TOKEN"
+  ],
+  "load_timeout": 900,
+  "log_buffer_size": 5000
+}
