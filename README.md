@@ -68,7 +68,46 @@ curl http://localhost:4468/status
 ```
 
 **Load a model (blocks until ready):**
+
+The typical workflow is to offload any running model, then load the new one. The `/load` endpoint blocks until the model is fully loaded and ready to serve.
+
 ```bash
+# Offload the current model (if any)
+curl -X POST http://localhost:4468/offload
+
+# Watch logs in real-time (new terminal)
+curl -N http://localhost:4468/logs
+
+# Load a new model (blocks until ready)
+curl -X POST http://localhost:4468/load \
+  -H "Content-Type: application/json" \
+  -d '{...}'
+```
+
+**Example: Switch to a different model:**
+```bash
+curl -X POST http://localhost:4468/offload && curl -X POST http://localhost:4468/load \
+  -H "Content-Type: application/json" \
+  -d '{...}'
+```
+
+**Example models:**
+
+```bash
+# unsloth/Qwen3.6-35B-A3B-MTP-GGUF:UD-Q4_K_XL
+curl -X POST http://localhost:4468/load \
+  -H "Content-Type: application/json" \
+  -d '{
+    "hf_repo": "unsloth/Qwen3.6-35B-A3B-MTP-GGUF:UD-Q4_K_XL",
+    "context": 260000,
+    "gpu_layers": 99,
+    "flash_attention": true,
+    "parallel": 1,
+    "env": { "LLAMA_CACHE": "unsloth/Qwen3.6-35B-A3B-MTP-GGUF" },
+    "flags": { "spec-type": "draft-mtp", "spec-draft-n-max": 2 }
+  }'
+
+# unsloth/Qwen3.6-27B-MTP-GGUF:UD-Q5_K_XL
 curl -X POST http://localhost:4468/load \
   -H "Content-Type: application/json" \
   -d '{
@@ -77,24 +116,35 @@ curl -X POST http://localhost:4468/load \
     "gpu_layers": 99,
     "flash_attention": true,
     "parallel": 1,
-    "env": {
-      "LLAMA_CACHE": "unsloth/Qwen3.6-27B-MTP-GGUF"
-    },
-    "flags": {
-      "spec-type": "draft-mtp",
-      "spec-draft-n-max": 2
-    }
+    "env": { "LLAMA_CACHE": "unsloth/Qwen3.6-27B-MTP-GGUF" },
+    "flags": { "spec-type": "draft-mtp", "spec-draft-n-max": 2 }
   }'
-```
 
-**Watch logs in real-time:**
-```bash
-curl -N http://localhost:4468/logs
-```
+# unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q6_K_XL
+curl -X POST http://localhost:4468/load \
+  -H "Content-Type: application/json" \
+  -d '{
+    "hf_repo": "unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q6_K_XL",
+    "context": 260000,
+    "gpu_layers": 99,
+    "flash_attention": true,
+    "parallel": 1,
+    "env": { "LLAMA_CACHE": "unsloth/gemma-4-26B-A4B-it-GGUF" },
+    "flags": { "temp": 1.0, "top-p": 0.95, "top-k": 64 }
+  }'
 
-**Offload the model:**
-```bash
-curl -X POST http://localhost:4468/offload
+# unsloth/gemma-4-31B-it-GGUF:UD-Q5_K_XL
+curl -X POST http://localhost:4468/load \
+  -H "Content-Type: application/json" \
+  -d '{
+    "hf_repo": "unsloth/gemma-4-31B-it-GGUF:UD-Q5_K_XL",
+    "context": 131072,
+    "gpu_layers": 99,
+    "flash_attention": true,
+    "parallel": 1,
+    "env": { "LLAMA_CACHE": "unsloth/gemma-4-31B-it-GGUF" },
+    "flags": { "temp": 1.0, "top-p": 0.95, "top-k": 64 }
+  }'
 ```
 
 ---
@@ -221,6 +271,22 @@ event: log
 data: {"type": "stderr", "line": "error: failed to allocate VRAM", "id": 102}
 ```
 *On connect, clients immediately receive the most recent log history from the in-memory buffer, followed by a continuous stream of live log entries.*
+
+**Usage with cURL:**
+```bash
+# Raw SSE stream (stays open until Ctrl+C)
+curl -N http://localhost:4468/logs
+
+# Parse JSON data lines only
+curl -N -s http://localhost:4468/logs | grep '^data: ' | sed 's/^data: //'
+
+# Pretty-print with jq
+curl -N -s http://localhost:4468/logs | grep '^data: ' | sed 's/^data: //' | jq .
+
+# Filter stderr only
+curl -N -s http://localhost:4468/logs | grep '^data: ' | sed 's/^data: //' | jq -r 'select(.type=="stderr") | .line'
+```
+*The `-N` flag disables cURL buffering for real-time output. Press Ctrl+C to disconnect.*
 
 ---
 
