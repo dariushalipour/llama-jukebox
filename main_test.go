@@ -4,11 +4,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"testing"
+	"time"
 )
 
 func TestNewLogBuffer(t *testing.T) {
@@ -415,6 +420,65 @@ func newTestJukebox() *Jukebox {
 	return NewJukebox(cfg)
 }
 
+func writeBlockingProcessScript(t *testing.T) string {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "fake-llama.sh")
+	script := "#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile :; do\n  sleep 1\ndone\n"
+	if err := os.WriteFile(path, []byte(script), 0755); err != nil {
+		t.Fatalf("failed to write helper script: %v", err)
+	}
+	return path
+}
+
+func readyEndpoint(t *testing.T) (string, int) {
+	t.Helper()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(server.Close)
+
+	host, portStr, err := net.SplitHostPort(server.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("failed to parse readiness address: %v", err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("failed to parse readiness port: %v", err)
+	}
+	return host, port
+}
+
+func newProcessTestJukebox(t *testing.T) *Jukebox {
+	t.Helper()
+
+	host, port := readyEndpoint(t)
+	cfg := Config{
+		LlamaBinary:   writeBlockingProcessScript(t),
+		Workdir:       t.TempDir(),
+		LlamaHost:     host,
+		LlamaPort:     port,
+		ListenAddr:    ":4468",
+		LoadTimeout:   5,
+		LogBufferSize: 500,
+	}
+	return NewJukebox(cfg)
+}
+
+func waitForState(t *testing.T, j *Jukebox, want string) {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := j.Status().State; got == want {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for state %q; last state %q", want, j.Status().State)
+}
+
 func TestHandleStatusIdle(t *testing.T) {
 	j := newTestJukebox()
 
@@ -501,6 +565,99 @@ func TestHandleLoadMethodNotAllowed(t *testing.T) {
 
 	if w.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("expected status 405, got %d", w.Code)
+	}
+}
+
+func TestLoadKeepsProcessRunningAfterContextCancel(t *testing.T) {
+	j := newProcessTestJukebox(t)
+	req := LoadRequest{HFRepo: "repo/model"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() {
+		if err := j.Offload(); err != nil {
+			t.Fatalf("offload failed: %v", err)
+		}
+	}()
+
+	if err := j.Load(ctx, req); err != nil {
+		t.Fatalf("load failed: %v", err)
+	}
+	waitForState(t, j, "running")
+
+	cancel()
+	time.Sleep(200 * time.Millisecond)
+
+	if got := j.Status().State; got != "running" {
+		t.Fatalf("expected process to outlive request context cancel, got %q", got)
+	}
+}
+
+func TestLoadRejectsConcurrentStarts(t *testing.T) {
+	j := newProcessTestJukebox(t)
+	req := LoadRequest{HFRepo: "repo/model"}
+	start := make(chan struct{})
+	results := make(chan error, 2)
+
+	for i := 0; i < 2; i++ {
+		go func() {
+			<-start
+			results <- j.Load(context.Background(), req)
+		}()
+	}
+
+	close(start)
+	err1 := <-results
+	err2 := <-results
+
+	successes := 0
+	conflicts := 0
+	for _, err := range []error{err1, err2} {
+		switch {
+		case err == nil:
+			successes++
+		case errors.As(err, new(ErrConflict)):
+			conflicts++
+		default:
+			t.Fatalf("unexpected load result: %v", err)
+		}
+	}
+
+	if successes != 1 || conflicts != 1 {
+		t.Fatalf("expected one success and one conflict, got %d successes and %d conflicts", successes, conflicts)
+	}
+
+	if err := j.Offload(); err != nil {
+		t.Fatalf("offload failed: %v", err)
+	}
+	waitForState(t, j, "idle")
+}
+
+func TestMonitorProcessSignalsCapturedExitChannel(t *testing.T) {
+	script := filepath.Join(t.TempDir(), "exit-immediately.sh")
+	contents := "#!/bin/sh\nexit 0\n"
+	if err := os.WriteFile(script, []byte(contents), 0755); err != nil {
+		t.Fatalf("failed to write helper script: %v", err)
+	}
+
+	cmd := execCommandContextless(t, script)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("failed to start helper process: %v", err)
+	}
+
+	j := newTestJukebox()
+	exited := make(chan error, 1)
+	j.cmd = cmd
+	j.processExited = exited
+
+	go j.monitorProcess(cmd, exited)
+
+	j.mu.Lock()
+	j.processExited = make(chan error, 1)
+	j.mu.Unlock()
+
+	select {
+	case <-exited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("monitorProcess did not signal the captured exit channel")
 	}
 }
 
@@ -658,4 +815,9 @@ func TestWriteExampleConfigCreatesParentDir(t *testing.T) {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		t.Fatal("config file was not created")
 	}
+}
+
+func execCommandContextless(t *testing.T, script string) *exec.Cmd {
+	t.Helper()
+	return exec.Command(script)
 }

@@ -113,6 +113,7 @@ type Jukebox struct {
 
 	cmd        *exec.Cmd
 	currentMod *ModelStatus
+	loading    bool
 
 	logs        *LogBuffer
 	subscribers []chan LogEntry
@@ -179,11 +180,11 @@ func (j *Jukebox) Status() StatusResponse {
 
 // monitorProcess is the single goroutine that calls cmd.Wait().
 // It reaps the zombie and resets state when the process exits.
-func (j *Jukebox) monitorProcess(cmd *exec.Cmd) {
+func (j *Jukebox) monitorProcess(cmd *exec.Cmd, exited chan error) {
 	err := cmd.Wait()
 
 	select {
-	case j.processExited <- err:
+	case exited <- err:
 	default:
 		// nobody is waiting (e.g., process exited before Offload started waiting)
 	}
@@ -192,6 +193,7 @@ func (j *Jukebox) monitorProcess(cmd *exec.Cmd) {
 	if j.cmd == cmd {
 		j.cmd = nil
 		j.currentMod = nil
+		j.loading = false
 	}
 	j.mu.Unlock()
 }
@@ -203,19 +205,19 @@ func (j *Jukebox) Offload() error {
 		return nil
 	}
 	cmd := j.cmd
+	oldOffloadSig := j.offloadSig
+	oldExited := j.processExited
 	j.cmd = nil
 	j.currentMod = nil
-
-	// Capture the old signal channel and replace with a fresh one — all under the lock.
-	oldOffloadSig := j.offloadSig
-	j.offloadSig = make(chan struct{})
-	// Create a fresh exited channel so the old monitorProcess won't block on it.
-	oldExited := j.processExited
-	j.processExited = make(chan error, 1)
+	j.loading = false
+	j.offloadSig = nil
+	j.processExited = nil
 	j.mu.Unlock()
 
 	// Abort any in-flight waitForReady
-	close(oldOffloadSig)
+	if oldOffloadSig != nil {
+		close(oldOffloadSig)
+	}
 
 	_ = cmd.Process.Signal(syscall.SIGTERM)
 
@@ -239,13 +241,6 @@ func (j *Jukebox) Load(ctx context.Context, req LoadRequest) error {
 	if err := j.validateRequest(req); err != nil {
 		return err
 	}
-
-	j.mu.Lock()
-	if j.cmd != nil && j.cmd.Process != nil {
-		j.mu.Unlock()
-		return ErrConflict{"a model is already running; offload it first"}
-	}
-	j.mu.Unlock()
 
 	args := []string{}
 	args = append(args, "-hf", req.HFRepo)
@@ -278,7 +273,7 @@ func (j *Jukebox) Load(ctx context.Context, req LoadRequest) error {
 		}
 	}
 
-	cmd := exec.CommandContext(ctx, j.config.LlamaBinary, args...)
+	cmd := exec.Command(j.config.LlamaBinary, args...)
 	cmd.Dir = j.config.Workdir
 	cmd.Env = os.Environ()
 	for k, v := range req.Env {
@@ -294,25 +289,32 @@ func (j *Jukebox) Load(ctx context.Context, req LoadRequest) error {
 		return err
 	}
 
+	j.mu.Lock()
+	if j.loading || (j.cmd != nil && j.cmd.Process != nil) {
+		j.mu.Unlock()
+		return ErrConflict{"a model is already running; offload it first"}
+	}
+	j.loading = true
 	if err := cmd.Start(); err != nil {
+		j.loading = false
+		j.mu.Unlock()
 		return fmt.Errorf("failed to start llama-server: %v", err)
 	}
-
-	// Set state atomically under lock
-	j.mu.Lock()
-	j.offloadSig = make(chan struct{})
-	j.processExited = make(chan error, 1)
+	offloadCh := make(chan struct{})
+	exitedCh := make(chan error, 1)
+	j.offloadSig = offloadCh
+	j.processExited = exitedCh
 	j.cmd = cmd
 	j.currentMod = &ModelStatus{
 		HFRepo:    req.HFRepo,
 		StartedAt: time.Now(),
 	}
-	offloadCh := j.offloadSig
+	j.loading = false
 	j.mu.Unlock()
 
-	go j.monitorProcess(cmd)
-	go j.streamLogs(ctx, stdout, "stdout")
-	go j.streamLogs(ctx, stderr, "stderr")
+	go j.monitorProcess(cmd, exitedCh)
+	go j.streamLogs(stdout, "stdout")
+	go j.streamLogs(stderr, "stderr")
 
 	if err := j.waitForReady(ctx, offloadCh); err != nil {
 		_ = j.Offload()
@@ -364,7 +366,7 @@ func (j *Jukebox) validateRequest(req LoadRequest) error {
 	return nil
 }
 
-func (j *Jukebox) streamLogs(ctx context.Context, r io.Reader, logType string) {
+func (j *Jukebox) streamLogs(r io.Reader, logType string) {
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -374,11 +376,6 @@ func (j *Jukebox) streamLogs(ctx context.Context, r io.Reader, logType string) {
 			Line: line,
 			ID:   time.Now().UnixNano(),
 		})
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
 	}
 	if err := scanner.Err(); err != nil {
 		log.Printf("streamLogs(%s): %v", logType, err)
