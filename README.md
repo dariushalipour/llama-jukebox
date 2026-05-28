@@ -296,8 +296,8 @@ curl -N -s http://localhost:4468/logs | grep '^data: ' | sed 's/^data: //' | jq 
 ## 6. Implementation Guidelines for Developers
 
 1.  **Concurrency**: Use `context.Context` throughout to ensure that if the daemon is shut down, the `llama-server` child process is immediately and gracefully terminated.
-2.  **Single Wait Contract**: Only `monitorProcess` calls `cmd.Wait()`. `Offload` signals termination via `SIGTERM`/`SIGKILL` and waits on a `processExited` channel that `monitorProcess` writes to. This prevents double-wait races and zombie processes.
-3.  **Atomic State Transitions**: All mutations to `j.cmd`, `j.currentMod`, `j.offloadSig`, and `j.processExited` happen under `j.mu` to prevent races between `Load` and `Offload`.
+2.  **Single Wait Contract**: Only `monitorProcess` calls `cmd.Wait()`. `Offload` signals termination via `SIGTERM`/`SIGKILL` and waits on a `processDone` channel that `monitorProcess` closes on exit. This prevents double-wait races and zombie processes.
+3.  **Atomic State Transitions**: All mutations to `j.cmd`, `j.currentMod`, `j.offloadSig`, and `j.processDone` happen under `j.mu` to prevent races between `Load` and `Offload`.
 4.  **Log Buffering**: Implement a thread-safe ring buffer for logs. Use a `sync.RWMutex` to allow multiple concurrent SSE clients to read the history without blocking the main log-writing loop.
 5.  **Error Codes**: Client validation errors return `400 Bad Request`. Server-side failures (timeout, crash) return `500 Internal Server Error`.
 6.  **No External Dependencies**: Strictly use the Go Standard Library to ensure the binary remains small and highly auditable.
