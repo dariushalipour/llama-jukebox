@@ -305,12 +305,21 @@ func (j *Jukebox) Load(ctx context.Context, req LoadRequest) error {
 	go j.streamLogs(stdout, "stdout")
 	go j.streamLogs(stderr, "stderr")
 
-	if err := j.waitForReady(ctx, offloadCh); err != nil {
+	if err := j.waitForReady(ctx, offloadCh, doneCh); err != nil {
 		_ = j.Offload()
 		return fmt.Errorf("model failed to reach ready state: %v", err)
 	}
 
 	return nil
+}
+
+func (j *Jukebox) isAllowedFlag(flag string) bool {
+	for _, allowed := range j.config.AllowedFlags {
+		if allowed == flag {
+			return true
+		}
+	}
+	return false
 }
 
 func (j *Jukebox) validateRequest(req LoadRequest) error {
@@ -319,6 +328,18 @@ func (j *Jukebox) validateRequest(req LoadRequest) error {
 	}
 	if !isSafe(req.HFRepo) {
 		return fmt.Errorf("invalid HF_REPO: contains unsafe characters")
+	}
+	if req.Context > 0 && !j.isAllowedFlag("c") {
+		return fmt.Errorf("flag c is not whitelisted")
+	}
+	if req.GPULayers > 0 && !j.isAllowedFlag("ngl") {
+		return fmt.Errorf("flag ngl is not whitelisted")
+	}
+	if req.FlashAttention && !j.isAllowedFlag("fa") {
+		return fmt.Errorf("flag fa is not whitelisted")
+	}
+	if req.Parallel > 0 && !j.isAllowedFlag("np") {
+		return fmt.Errorf("flag np is not whitelisted")
 	}
 
 	for k, v := range req.Env {
@@ -367,7 +388,7 @@ func (j *Jukebox) streamLogs(r io.Reader, logType string) {
 	}
 }
 
-func (j *Jukebox) waitForReady(ctx context.Context, offloadCh chan struct{}) error {
+func (j *Jukebox) waitForReady(ctx context.Context, offloadCh chan struct{}, doneCh <-chan struct{}) error {
 	client := &http.Client{Timeout: 2 * time.Second}
 	url := fmt.Sprintf("http://%s:%d/", j.config.LlamaHost, j.config.LlamaPort)
 
@@ -388,6 +409,8 @@ func (j *Jukebox) waitForReady(ctx context.Context, offloadCh chan struct{}) err
 			return ctx.Err()
 		case <-offloadCh:
 			return fmt.Errorf("model was offloaded during loading")
+		case <-doneCh:
+			return fmt.Errorf("llama-server exited before becoming ready")
 		case <-timer.C:
 			return fmt.Errorf("timeout waiting for llama-server to become ready")
 		case <-ticker.C:

@@ -399,6 +399,74 @@ func TestValidateRequestFlagUnsafeValue(t *testing.T) {
 	}
 }
 
+func TestValidateRequestStructuredFlagsRequireWhitelist(t *testing.T) {
+	tests := []struct {
+		name   string
+		req    LoadRequest
+		errMsg string
+	}{
+		{
+			name:   "context requires c whitelist",
+			req:    LoadRequest{HFRepo: "repo/model", Context: 4096},
+			errMsg: "flag c is not whitelisted",
+		},
+		{
+			name:   "gpu layers require ngl whitelist",
+			req:    LoadRequest{HFRepo: "repo/model", GPULayers: 99},
+			errMsg: "flag ngl is not whitelisted",
+		},
+		{
+			name:   "flash attention requires fa whitelist",
+			req:    LoadRequest{HFRepo: "repo/model", FlashAttention: true},
+			errMsg: "flag fa is not whitelisted",
+		},
+		{
+			name:   "parallel requires np whitelist",
+			req:    LoadRequest{HFRepo: "repo/model", Parallel: 2},
+			errMsg: "flag np is not whitelisted",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			j := NewJukebox(Config{
+				LlamaBinary: "/usr/bin/llama-server",
+				Workdir:     "/tmp",
+				LlamaHost:   "localhost",
+				LlamaPort:   8080,
+			})
+
+			err := j.validateRequest(tt.req)
+			if err == nil || err.Error() != tt.errMsg {
+				t.Fatalf("expected error %q, got %v", tt.errMsg, err)
+			}
+		})
+	}
+}
+
+func TestValidateRequestStructuredFlagsAllowed(t *testing.T) {
+	j := NewJukebox(Config{
+		LlamaBinary:  "/usr/bin/llama-server",
+		Workdir:      "/tmp",
+		LlamaHost:    "localhost",
+		LlamaPort:    8080,
+		AllowedFlags: []string{"c", "ngl", "fa", "np", "temp"},
+	})
+
+	req := LoadRequest{
+		HFRepo:         "repo/model",
+		Context:        4096,
+		GPULayers:      99,
+		FlashAttention: true,
+		Parallel:       2,
+		Flags:          map[string]interface{}{"temp": 0.8},
+	}
+
+	if err := j.validateRequest(req); err != nil {
+		t.Fatalf("expected success, got error: %v", err)
+	}
+}
+
 func TestErrConflict(t *testing.T) {
 	e := ErrConflict{"a model is already running"}
 	if e.Error() != "a model is already running" {
@@ -427,6 +495,17 @@ func writeBlockingProcessScript(t *testing.T) string {
 
 	path := filepath.Join(t.TempDir(), "fake-llama.sh")
 	script := "#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile :; do\n  sleep 1\ndone\n"
+	if err := os.WriteFile(path, []byte(script), 0755); err != nil {
+		t.Fatalf("failed to write helper script: %v", err)
+	}
+	return path
+}
+
+func writeExitProcessScript(t *testing.T, exitCode int) string {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "exit-llama.sh")
+	script := "#!/bin/sh\nexit " + strconv.Itoa(exitCode) + "\n"
 	if err := os.WriteFile(path, []byte(script), 0755); err != nil {
 		t.Fatalf("failed to write helper script: %v", err)
 	}
@@ -490,6 +569,22 @@ func newSlowOffloadTestJukebox(t *testing.T, delay time.Duration) *Jukebox {
 		LlamaPort:     port,
 		ListenAddr:    ":4468",
 		LoadTimeout:   5,
+		LogBufferSize: 500,
+	}
+	return NewJukebox(cfg)
+}
+
+func newExitBeforeReadyTestJukebox(t *testing.T) *Jukebox {
+	t.Helper()
+
+	host, port := readyEndpoint(t)
+	cfg := Config{
+		LlamaBinary:   writeExitProcessScript(t, 1),
+		Workdir:       t.TempDir(),
+		LlamaHost:     host,
+		LlamaPort:     port,
+		ListenAddr:    ":4468",
+		LoadTimeout:   30,
 		LogBufferSize: 500,
 	}
 	return NewJukebox(cfg)
@@ -701,6 +796,24 @@ func TestLoadRejectsStartWhileOffloadInProgress(t *testing.T) {
 	if err := j.Offload(); err != nil {
 		t.Fatalf("cleanup offload failed: %v", err)
 	}
+}
+
+func TestLoadFailsFastWhenProcessExitsBeforeReady(t *testing.T) {
+	j := newExitBeforeReadyTestJukebox(t)
+	start := time.Now()
+
+	err := j.Load(context.Background(), LoadRequest{HFRepo: "repo/model"})
+	if err == nil {
+		t.Fatal("expected load to fail when process exits before readiness")
+	}
+	if !strings.Contains(err.Error(), "llama-server exited before becoming ready") {
+		t.Fatalf("expected early-exit error, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed >= 2*time.Second {
+		t.Fatalf("expected early-exit failure before readiness polling timeout, got %v", elapsed)
+	}
+
+	waitForState(t, j, "idle")
 }
 
 func TestMonitorProcessClosesCapturedDoneChannel(t *testing.T) {

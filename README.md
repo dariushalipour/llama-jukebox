@@ -164,7 +164,7 @@ The `config.json` file is the single source of truth for the daemon's security b
 | `llama_host` | `string` | **Mandatory.** The IP/Hostname the `llama-server` will bind to. |
 | `llama_port` | `int` | **Mandatory.** The port the `llama-server` will listen on. |
 | `listen_addr` | `string` | (Optional, default `:4468`). The address the daemon listens on. |
-| `allowed_flags` | `[]string` | A list of permitted command-line flags (e.g., `["temp", "top-p", "spec-type"]`). |
+| `allowed_flags` | `[]string` | A list of permitted command-line flags (e.g., `["temp", "top-p", "spec-type"]`). This also gates the structured request fields: `context -> c`, `gpu_layers -> ngl`, `flash_attention -> fa`, `parallel -> np`. |
 | `allowed_env` | `[]string` | A list of permitted environment variable keys (e.g., `["LLAMA_CACHE"]`). |
 | `load_timeout` | `int` | (Optional) Max seconds to wait for the model to load before failing. |
 | `log_buffer_size`| `int` | (Optional) Number of log lines to keep in the in-memory ring buffer. |
@@ -176,6 +176,7 @@ The daemon implements a multi-layered defense strategy:
 1.  **No Shell Execution**: The daemon uses `os/exec.Command` to invoke the binary directly. It never invokes `/bin/sh` or `/bin/bash`, rendering shell metacharacter injection (like `; rm -rf /`) ineffective at the process level.
 2.  **Parameter Whitelisting**: 
     *   **Flags**: Only keys present in `allowed_flags` are accepted in the `/load` body.
+  *   **Structured Load Fields**: `context`, `gpu_layers`, `flash_attention`, and `parallel` are translated to `c`, `ngl`, `fa`, and `np`, and are rejected unless those flags are also present in `allowed_flags`.
     *   **Environment**: Only keys present in `allowed_env` are accepted.
 3.  **Strict String Validation**: Every string input (model names, paths, flag values) is scanned for shell-sensitive characters: `` ` $ ( ) [ ] { } | ; & < > ! `` and whitespace. Any such character triggers an immediate `400 Bad Request`.
 4.  **Fixed Infrastructure**: The network binding (`host`/`port`) and the executable path are locked in `config.json`. An attacker cannot use the API to redirect the server to a different port or execute a different binary.
@@ -194,7 +195,8 @@ The daemon implements a multi-layered defense strategy:
     *   **Success**: If the server returns `200 OK`, the model is considered "fully loaded and idle."
     *   **Failure**: If the connection is refused or returns a non-200 status (indicating the server is still initializing), the daemon waits and retries.
     *   **External Offload**: If `/offload` is called during this polling, the request is aborted immediately via a signaling channel.
-    *   **Client Cancel**: If the HTTP client disconnects, the context cancels, triggering the `CommandContext` to terminate the child process.
+    *   **Client Cancel During Load**: If the HTTP client disconnects before readiness succeeds, the load is aborted and the child process is offloaded.
+    *   **After Ready**: Once `/load` returns success, later client disconnects do not affect the running model; it stays up until `/offload`, process exit, or daemon shutdown.
 7.  **Completion**: Once ready, the `/load` request returns `{"status": "success"}`.
 
 #### The `/offload` Workflow
