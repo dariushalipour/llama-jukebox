@@ -178,14 +178,15 @@ The daemon implements a multi-layered defense strategy:
     *   **Flags**: Only keys present in `allowed_flags` are accepted in the `/load` body.
   *   **Structured Load Fields**: `context`, `gpu_layers`, `flash_attention`, and `parallel` are translated to `c`, `ngl`, `fa`, and `np`, and are rejected unless those flags are also present in `allowed_flags`.
     *   **Environment**: Only keys present in `allowed_env` are accepted.
-3.  **Strict String Validation**: Every string input (model names, paths, flag values) is scanned for shell-sensitive characters: `` ` $ ( ) [ ] { } | ; & < > ! `` and whitespace. Any such character triggers an immediate `400 Bad Request`.
-4.  **Fixed Infrastructure**: The network binding (`host`/`port`) and the executable path are locked in `config.json`. An attacker cannot use the API to redirect the server to a different port or execute a different binary.
+3.  **Strict String Validation**: Every string input (model names, paths, flag values) is scanned for shell-sensitive characters: `` ` $ ( ) [ ] { } | ; & < > ! `` and all whitespace. Any such character triggers an immediate `400 Bad Request`.
+4.  **Strict JSON Parsing**: The `/load` body must contain exactly one JSON object, and unknown fields are rejected with `400 Bad Request`.
+5.  **Fixed Infrastructure**: The network binding (`host`/`port`) and the executable path are locked in `config.json` and passed directly to `llama-server`. An attacker cannot use the API to redirect the server to a different port or execute a different binary.
 
 ### 4.3 Process Lifecycle & Readiness Detection
 
 #### The `/load` Workflow
 1.  **Request Received**: Client sends a `POST /load` with the desired model configuration.
-2.  **Validation**: The daemon verifies all flags and env vars against `config.json` and checks string safety. Empty `hf_repo` is rejected.
+2.  **Validation**: The daemon verifies all flags and env vars against `config.json`, checks string safety, and rejects unknown JSON fields or extra JSON values in the request body. Empty `hf_repo` is rejected.
 3.  **Conflict Check**: If a `llama-server` is already running, the daemon returns `409 Conflict`.
 4.  **Execution**: `llama-server` is launched as a child process using the fixed `llama_binary` and `workdir`.
 5.  **Process Monitor**: A dedicated goroutine calls `cmd.Wait()` to detect if the process exits on its own (OOM, crash, segfault). If it does, the zombie is reaped and state is automatically reset to `idle`.
@@ -253,7 +254,7 @@ Triggers the loading of a model. **This call is blocking.**
 ```
 **Success Response**: `200 OK` with `{"status": "success"}`.
 **Error Responses**:
-- `400 Bad Request` — invalid JSON, unsafe characters, non-whitelisted flags/env vars, or model was offloaded during loading.
+- `400 Bad Request` — invalid JSON, unknown JSON fields, extra JSON values, unsafe characters, non-whitelisted flags/env vars, or model was offloaded during loading.
 - `409 Conflict` — a model is already running.
 - `500 Internal Server Error` — timeout waiting for readiness, failed to start process, or model crashed during loading.
 

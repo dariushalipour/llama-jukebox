@@ -148,6 +148,8 @@ func TestIsSafe(t *testing.T) {
 
 	unsafe := []string{
 		"hello world",
+		"hello\tworld",
+		"hello\nworld",
 		"hello`",
 		"hello$",
 		"hello|",
@@ -651,6 +653,91 @@ func TestHandleLoadInvalidJSON(t *testing.T) {
 	}
 }
 
+func TestHandleLoadRejectsUnknownFields(t *testing.T) {
+	j := newTestJukebox()
+
+	body := []byte(`{"hf_repo":"repo/model","gpu_layer":1}`)
+	req := httptest.NewRequest(http.MethodPost, "/load", bytes.NewBuffer(body))
+	w := httptest.NewRecorder()
+
+	j.handleLoad(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "unknown field") {
+		t.Fatalf("expected unknown field error, got %q", w.Body.String())
+	}
+}
+
+func TestHandleLoadRejectsTrailingJSON(t *testing.T) {
+	j := newTestJukebox()
+
+	body := []byte(`{"hf_repo":"repo/model"} {}`)
+	req := httptest.NewRequest(http.MethodPost, "/load", bytes.NewBuffer(body))
+	w := httptest.NewRecorder()
+
+	j.handleLoad(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d", w.Code)
+	}
+}
+
+func TestLoadPassesConfiguredHostAndPort(t *testing.T) {
+	tmpDir := t.TempDir()
+	argsFile := filepath.Join(tmpDir, "args.txt")
+	script := filepath.Join(tmpDir, "capture-args.sh")
+	contents := "#!/bin/sh\nprintf '%s\\n' \"$@\" >\"$LLAMA_ARGS_FILE\"\ntrap 'exit 0' TERM INT\nwhile :; do\n  sleep 1\ndone\n"
+	if err := os.WriteFile(script, []byte(contents), 0755); err != nil {
+		t.Fatalf("failed to write helper script: %v", err)
+	}
+
+	host, port := readyEndpoint(t)
+	j := NewJukebox(Config{
+		LlamaBinary:   script,
+		Workdir:       tmpDir,
+		LlamaHost:     host,
+		LlamaPort:     port,
+		LoadTimeout:   5,
+		LogBufferSize: 500,
+	})
+
+	originalEnv := os.Getenv("LLAMA_ARGS_FILE")
+	if err := os.Setenv("LLAMA_ARGS_FILE", argsFile); err != nil {
+		t.Fatalf("failed to set LLAMA_ARGS_FILE: %v", err)
+	}
+	defer func() {
+		if originalEnv == "" {
+			_ = os.Unsetenv("LLAMA_ARGS_FILE")
+			return
+		}
+		_ = os.Setenv("LLAMA_ARGS_FILE", originalEnv)
+	}()
+
+	if err := j.Load(context.Background(), LoadRequest{HFRepo: "repo/model"}); err != nil {
+		t.Fatalf("load failed: %v", err)
+	}
+	defer func() {
+		if err := j.Offload(); err != nil {
+			t.Fatalf("offload failed: %v", err)
+		}
+	}()
+
+	data, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatalf("failed to read captured args: %v", err)
+	}
+	args := strings.Fields(string(data))
+
+	expected := []string{"-hf", "repo/model", "--host", host, "--port", strconv.Itoa(port)}
+	for _, arg := range expected {
+		if !containsArg(args, arg) {
+			t.Fatalf("expected args %v to contain %q", args, arg)
+		}
+	}
+}
+
 func TestHandleLoadMissingHFRepo(t *testing.T) {
 	j := newTestJukebox()
 
@@ -1066,4 +1153,13 @@ func TestWriteExampleConfigCreatesParentDir(t *testing.T) {
 func execCommandContextless(t *testing.T, script string) *exec.Cmd {
 	t.Helper()
 	return exec.Command(script)
+}
+
+func containsArg(args []string, want string) bool {
+	for _, arg := range args {
+		if arg == want {
+			return true
+		}
+	}
+	return false
 }

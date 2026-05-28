@@ -16,6 +16,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
 )
 
 type Config struct {
@@ -130,10 +131,13 @@ func NewJukebox(cfg Config) *Jukebox {
 	}
 }
 
-var unsafeRunes = []rune{'`', '$', '|', '&', ';', '<', '>', '(', ')', '[', ']', '{', '}', '!', ' '}
+var unsafeRunes = []rune{'`', '$', '|', '&', ';', '<', '>', '(', ')', '[', ']', '{', '}', '!'}
 
 func isSafe(s string) bool {
 	for _, r := range s {
+		if unicode.IsSpace(r) {
+			return false
+		}
 		for _, u := range unsafeRunes {
 			if r == u {
 				return false
@@ -234,6 +238,7 @@ func (j *Jukebox) Load(ctx context.Context, req LoadRequest) error {
 	}
 
 	args := []string{"-hf", req.HFRepo}
+	args = append(args, "--host", j.config.LlamaHost, "--port", fmt.Sprintf("%d", j.config.LlamaPort))
 
 	if req.Context > 0 {
 		args = append(args, "-c", fmt.Sprintf("%d", req.Context))
@@ -473,7 +478,17 @@ func (j *Jukebox) handleLoad(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req LoadRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "request body must contain exactly one JSON object"})
+			return
+		}
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
