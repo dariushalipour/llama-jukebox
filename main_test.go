@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -431,6 +433,17 @@ func writeBlockingProcessScript(t *testing.T) string {
 	return path
 }
 
+func writeSlowExitProcessScript(t *testing.T, delay time.Duration) string {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "slow-exit-llama.sh")
+	script := "#!/bin/sh\ntrap 'sleep " + strconv.Itoa(int(delay/time.Second)) + "; exit 0' TERM INT\nwhile :; do\n  sleep 1\ndone\n"
+	if err := os.WriteFile(path, []byte(script), 0755); err != nil {
+		t.Fatalf("failed to write helper script: %v", err)
+	}
+	return path
+}
+
 func readyEndpoint(t *testing.T) (string, int) {
 	t.Helper()
 
@@ -456,6 +469,22 @@ func newProcessTestJukebox(t *testing.T) *Jukebox {
 	host, port := readyEndpoint(t)
 	cfg := Config{
 		LlamaBinary:   writeBlockingProcessScript(t),
+		Workdir:       t.TempDir(),
+		LlamaHost:     host,
+		LlamaPort:     port,
+		ListenAddr:    ":4468",
+		LoadTimeout:   5,
+		LogBufferSize: 500,
+	}
+	return NewJukebox(cfg)
+}
+
+func newSlowOffloadTestJukebox(t *testing.T, delay time.Duration) *Jukebox {
+	t.Helper()
+
+	host, port := readyEndpoint(t)
+	cfg := Config{
+		LlamaBinary:   writeSlowExitProcessScript(t, delay),
 		Workdir:       t.TempDir(),
 		LlamaHost:     host,
 		LlamaPort:     port,
@@ -631,7 +660,50 @@ func TestLoadRejectsConcurrentStarts(t *testing.T) {
 	waitForState(t, j, "idle")
 }
 
-func TestMonitorProcessSignalsCapturedExitChannel(t *testing.T) {
+func TestLoadRejectsStartWhileOffloadInProgress(t *testing.T) {
+	j := newSlowOffloadTestJukebox(t, 2*time.Second)
+	req := LoadRequest{HFRepo: "repo/model"}
+
+	if err := j.Load(context.Background(), req); err != nil {
+		t.Fatalf("load failed: %v", err)
+	}
+	waitForState(t, j, "running")
+
+	offloadDone := make(chan error, 1)
+	go func() {
+		offloadDone <- j.Offload()
+	}()
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		j.mu.Lock()
+		stopping := j.stopping
+		j.mu.Unlock()
+		if stopping {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	err := j.Load(context.Background(), req)
+	if !errors.As(err, new(ErrConflict)) {
+		t.Fatalf("expected ErrConflict while offload is in progress, got %v", err)
+	}
+
+	if err := <-offloadDone; err != nil {
+		t.Fatalf("offload failed: %v", err)
+	}
+	waitForState(t, j, "idle")
+
+	if err := j.Load(context.Background(), req); err != nil {
+		t.Fatalf("expected load to succeed after offload completes, got %v", err)
+	}
+	if err := j.Offload(); err != nil {
+		t.Fatalf("cleanup offload failed: %v", err)
+	}
+}
+
+func TestMonitorProcessClosesCapturedDoneChannel(t *testing.T) {
 	script := filepath.Join(t.TempDir(), "exit-immediately.sh")
 	contents := "#!/bin/sh\nexit 0\n"
 	if err := os.WriteFile(script, []byte(contents), 0755); err != nil {
@@ -644,20 +716,20 @@ func TestMonitorProcessSignalsCapturedExitChannel(t *testing.T) {
 	}
 
 	j := newTestJukebox()
-	exited := make(chan error, 1)
+	done := make(chan struct{})
 	j.cmd = cmd
-	j.processExited = exited
+	j.processDone = done
 
-	go j.monitorProcess(cmd, exited)
+	go j.monitorProcess(cmd, done)
 
 	j.mu.Lock()
-	j.processExited = make(chan error, 1)
+	j.processDone = make(chan struct{})
 	j.mu.Unlock()
 
 	select {
-	case <-exited:
+	case <-done:
 	case <-time.After(2 * time.Second):
-		t.Fatal("monitorProcess did not signal the captured exit channel")
+		t.Fatal("monitorProcess did not close the captured done channel")
 	}
 }
 
@@ -726,6 +798,67 @@ func TestHandleLogsReturnsHistory(t *testing.T) {
 	// Verify headers were set
 	if w.Header().Get("Content-Type") != "text/event-stream" {
 		t.Errorf("expected content-type text/event-stream, got %q", w.Header().Get("Content-Type"))
+	}
+}
+
+func TestStreamLogsBroadcastsStoredEntry(t *testing.T) {
+	j := newTestJukebox()
+	sub := make(chan LogEntry, 1)
+
+	j.subMu.Lock()
+	j.subscribers = append(j.subscribers, sub)
+	j.subMu.Unlock()
+	defer func() {
+		j.subMu.Lock()
+		j.subscribers = nil
+		j.subMu.Unlock()
+	}()
+
+	r, w := io.Pipe()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		j.streamLogs(r, "stdout")
+	}()
+
+	if _, err := w.Write([]byte("hello world\n")); err != nil {
+		t.Fatalf("failed to write log line: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("failed to close log writer: %v", err)
+	}
+	<-done
+
+	entries := j.logs.GetEntries()
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 stored entry, got %d", len(entries))
+	}
+
+	select {
+	case entry := <-sub:
+		if entry != entries[0] {
+			t.Fatalf("expected broadcast entry %+v to match stored entry %+v", entry, entries[0])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for broadcast log entry")
+	}
+}
+
+func TestStreamLiveLogsSkipsAlreadySentEntries(t *testing.T) {
+	sub := make(chan LogEntry, 3)
+	sub <- LogEntry{Type: "stdout", Line: "history", ID: 2}
+	sub <- LogEntry{Type: "stdout", Line: "live", ID: 3}
+	close(sub)
+
+	w := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+	streamLiveLogs(context.Background(), w, sub, 2)
+
+	body := w.Body.String()
+	if strings.Contains(body, "history") {
+		t.Fatalf("expected already-sent history entry to be skipped, got body %q", body)
+	}
+	if !strings.Contains(body, "live") {
+		t.Fatalf("expected live entry to be written, got body %q", body)
 	}
 }
 

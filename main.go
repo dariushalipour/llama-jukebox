@@ -18,8 +18,6 @@ import (
 	"time"
 )
 
-// --- Types ---
-
 type Config struct {
 	LlamaBinary   string   `json:"llama_binary"`
 	Workdir       string   `json:"workdir"`
@@ -38,7 +36,7 @@ type ModelStatus struct {
 }
 
 type StatusResponse struct {
-	State string       `json:"state"` // "idle" or "running"
+	State string       `json:"state"`
 	PID   int          `json:"pid"`
 	Model *ModelStatus `json:"model,omitempty"`
 }
@@ -54,7 +52,7 @@ type LoadRequest struct {
 }
 
 type LogEntry struct {
-	Type string `json:"type"` // "stdout" or "stderr"
+	Type string `json:"type"`
 	Line string `json:"line"`
 	ID   int64  `json:"id"`
 }
@@ -64,8 +62,6 @@ type ErrConflict struct {
 }
 
 func (e ErrConflict) Error() string { return e.msg }
-
-// --- State Management ---
 
 type LogBuffer struct {
 	mu      sync.RWMutex
@@ -82,7 +78,7 @@ func NewLogBuffer(size int) *LogBuffer {
 	}
 }
 
-func (lb *LogBuffer) Add(logType, line string) {
+func (lb *LogBuffer) Add(logType, line string) LogEntry {
 	lb.mu.Lock()
 	defer lb.mu.Unlock()
 
@@ -97,11 +93,14 @@ func (lb *LogBuffer) Add(logType, line string) {
 		lb.entries = lb.entries[1:]
 	}
 	lb.entries = append(lb.entries, entry)
+
+	return entry
 }
 
 func (lb *LogBuffer) GetEntries() []LogEntry {
 	lb.mu.RLock()
 	defer lb.mu.RUnlock()
+
 	res := make([]LogEntry, len(lb.entries))
 	copy(res, lb.entries)
 	return res
@@ -114,28 +113,22 @@ type Jukebox struct {
 	cmd        *exec.Cmd
 	currentMod *ModelStatus
 	loading    bool
+	stopping   bool
 
 	logs        *LogBuffer
 	subscribers []chan LogEntry
 	subMu       sync.Mutex
 
-	// Signals waitForReady to abort when Offload is called externally
-	offloadSig chan struct{}
-
-	// Signals when the current process has fully exited (used by Offload)
-	processExited chan error
+	offloadSig  chan struct{}
+	processDone chan struct{}
 }
 
 func NewJukebox(cfg Config) *Jukebox {
 	return &Jukebox{
-		config:        cfg,
-		logs:          NewLogBuffer(cfg.LogBufferSize),
-		offloadSig:    make(chan struct{}),
-		processExited: make(chan error, 1),
+		config: cfg,
+		logs:   NewLogBuffer(cfg.LogBufferSize),
 	}
 }
-
-// --- Helpers ---
 
 var unsafeRunes = []rune{'`', '$', '|', '&', ';', '<', '>', '(', ')', '[', ']', '{', '}', '!', ' '}
 
@@ -153,6 +146,7 @@ func isSafe(s string) bool {
 func (j *Jukebox) broadcastLog(entry LogEntry) {
 	j.subMu.Lock()
 	defer j.subMu.Unlock()
+
 	for _, sub := range j.subscribers {
 		select {
 		case sub <- entry:
@@ -160,8 +154,6 @@ func (j *Jukebox) broadcastLog(entry LogEntry) {
 		}
 	}
 }
-
-// --- Core Logic ---
 
 func (j *Jukebox) Status() StatusResponse {
 	j.mu.Lock()
@@ -178,24 +170,21 @@ func (j *Jukebox) Status() StatusResponse {
 	return res
 }
 
-// monitorProcess is the single goroutine that calls cmd.Wait().
-// It reaps the zombie and resets state when the process exits.
-func (j *Jukebox) monitorProcess(cmd *exec.Cmd, exited chan error) {
-	err := cmd.Wait()
-
-	select {
-	case exited <- err:
-	default:
-		// nobody is waiting (e.g., process exited before Offload started waiting)
-	}
+func (j *Jukebox) monitorProcess(cmd *exec.Cmd, done chan struct{}) {
+	_ = cmd.Wait()
+	close(done)
 
 	j.mu.Lock()
+	defer j.mu.Unlock()
+
 	if j.cmd == cmd {
 		j.cmd = nil
 		j.currentMod = nil
 		j.loading = false
+		j.stopping = false
+		j.offloadSig = nil
+		j.processDone = nil
 	}
-	j.mu.Unlock()
 }
 
 func (j *Jukebox) Offload() error {
@@ -204,34 +193,36 @@ func (j *Jukebox) Offload() error {
 		j.mu.Unlock()
 		return nil
 	}
+
 	cmd := j.cmd
-	oldOffloadSig := j.offloadSig
-	oldExited := j.processExited
-	j.cmd = nil
-	j.currentMod = nil
-	j.loading = false
-	j.offloadSig = nil
-	j.processExited = nil
+	offloadCh := j.offloadSig
+	doneCh := j.processDone
+	alreadyStopping := j.stopping
+	if !alreadyStopping {
+		j.stopping = true
+		j.loading = false
+		j.offloadSig = nil
+	}
 	j.mu.Unlock()
 
-	// Abort any in-flight waitForReady
-	if oldOffloadSig != nil {
-		close(oldOffloadSig)
+	if !alreadyStopping && offloadCh != nil {
+		close(offloadCh)
+	}
+	if !alreadyStopping {
+		_ = cmd.Process.Signal(syscall.SIGTERM)
+	}
+	if doneCh == nil {
+		return nil
 	}
 
-	_ = cmd.Process.Signal(syscall.SIGTERM)
-
-	done := make(chan struct{}, 1)
-	go func() {
-		<-oldExited
-		done <- struct{}{}
-	}()
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
 
 	select {
-	case <-time.After(5 * time.Second):
+	case <-doneCh:
+	case <-timer.C:
 		_ = cmd.Process.Signal(syscall.SIGKILL)
-		<-done
-	case <-done:
+		<-doneCh
 	}
 
 	return nil
@@ -242,8 +233,7 @@ func (j *Jukebox) Load(ctx context.Context, req LoadRequest) error {
 		return err
 	}
 
-	args := []string{}
-	args = append(args, "-hf", req.HFRepo)
+	args := []string{"-hf", req.HFRepo}
 
 	if req.Context > 0 {
 		args = append(args, "-c", fmt.Sprintf("%d", req.Context))
@@ -290,7 +280,7 @@ func (j *Jukebox) Load(ctx context.Context, req LoadRequest) error {
 	}
 
 	j.mu.Lock()
-	if j.loading || (j.cmd != nil && j.cmd.Process != nil) {
+	if j.loading || j.stopping || (j.cmd != nil && j.cmd.Process != nil) {
 		j.mu.Unlock()
 		return ErrConflict{"a model is already running; offload it first"}
 	}
@@ -300,19 +290,18 @@ func (j *Jukebox) Load(ctx context.Context, req LoadRequest) error {
 		j.mu.Unlock()
 		return fmt.Errorf("failed to start llama-server: %v", err)
 	}
+
 	offloadCh := make(chan struct{})
-	exitedCh := make(chan error, 1)
+	doneCh := make(chan struct{})
 	j.offloadSig = offloadCh
-	j.processExited = exitedCh
+	j.processDone = doneCh
 	j.cmd = cmd
-	j.currentMod = &ModelStatus{
-		HFRepo:    req.HFRepo,
-		StartedAt: time.Now(),
-	}
+	j.currentMod = &ModelStatus{HFRepo: req.HFRepo, StartedAt: time.Now()}
 	j.loading = false
+	j.stopping = false
 	j.mu.Unlock()
 
-	go j.monitorProcess(cmd, exitedCh)
+	go j.monitorProcess(cmd, doneCh)
 	go j.streamLogs(stdout, "stdout")
 	go j.streamLogs(stderr, "stderr")
 
@@ -331,6 +320,7 @@ func (j *Jukebox) validateRequest(req LoadRequest) error {
 	if !isSafe(req.HFRepo) {
 		return fmt.Errorf("invalid HF_REPO: contains unsafe characters")
 	}
+
 	for k, v := range req.Env {
 		allowed := false
 		for _, a := range j.config.AllowedEnv {
@@ -346,6 +336,7 @@ func (j *Jukebox) validateRequest(req LoadRequest) error {
 			return fmt.Errorf("unsafe value for env %s", k)
 		}
 	}
+
 	for k, v := range req.Flags {
 		allowed := false
 		for _, a := range j.config.AllowedFlags {
@@ -357,25 +348,19 @@ func (j *Jukebox) validateRequest(req LoadRequest) error {
 		if !allowed {
 			return fmt.Errorf("flag %s is not whitelisted", k)
 		}
-		if strVal, ok := v.(string); ok {
-			if !isSafe(strVal) {
-				return fmt.Errorf("unsafe value for flag %s", k)
-			}
+		if strVal, ok := v.(string); ok && !isSafe(strVal) {
+			return fmt.Errorf("unsafe value for flag %s", k)
 		}
 	}
+
 	return nil
 }
 
 func (j *Jukebox) streamLogs(r io.Reader, logType string) {
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
-		line := scanner.Text()
-		j.logs.Add(logType, line)
-		j.broadcastLog(LogEntry{
-			Type: logType,
-			Line: line,
-			ID:   time.Now().UnixNano(),
-		})
+		entry := j.logs.Add(logType, scanner.Text())
+		j.broadcastLog(entry)
 	}
 	if err := scanner.Err(); err != nil {
 		log.Printf("streamLogs(%s): %v", logType, err)
@@ -406,7 +391,7 @@ func (j *Jukebox) waitForReady(ctx context.Context, offloadCh chan struct{}) err
 		case <-timer.C:
 			return fmt.Errorf("timeout waiting for llama-server to become ready")
 		case <-ticker.C:
-			req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 			resp, err := client.Do(req)
 			if err == nil {
 				if resp.StatusCode == http.StatusOK {
@@ -419,12 +404,35 @@ func (j *Jukebox) waitForReady(ctx context.Context, offloadCh chan struct{}) err
 	}
 }
 
-// --- HTTP Handlers ---
-
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(v)
+}
+
+func writeLogEvent(w io.Writer, entry LogEntry) {
+	fmt.Fprintf(w, "event: log\ndata: %s\n\n", mustMarshal(entry))
+}
+
+func streamLiveLogs(ctx context.Context, w http.ResponseWriter, sub <-chan LogEntry, lastSentID int64) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case entry, ok := <-sub:
+			if !ok {
+				return
+			}
+			if entry.ID <= lastSentID {
+				continue
+			}
+			writeLogEvent(w, entry)
+			lastSentID = entry.ID
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}
+	}
 }
 
 func (j *Jukebox) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -440,16 +448,19 @@ func (j *Jukebox) handleLoad(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "Method not allowed"})
 		return
 	}
+
 	var req LoadRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
+
 	if err := j.Load(r.Context(), req); err != nil {
 		if _, ok := err.(ErrConflict); ok {
 			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 			return
 		}
+
 		msg := err.Error()
 		if strings.Contains(msg, "offloaded during loading") {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": msg})
@@ -462,6 +473,7 @@ func (j *Jukebox) handleLoad(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": msg})
 		return
 	}
+
 	writeJSON(w, http.StatusOK, map[string]string{"status": "success"})
 }
 
@@ -487,7 +499,6 @@ func (j *Jukebox) handleLogs(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
-	// Subscribe FIRST to prevent missing logs emitted during history fetch
 	sub := make(chan LogEntry, 100)
 	j.subMu.Lock()
 	j.subscribers = append(j.subscribers, sub)
@@ -505,25 +516,18 @@ func (j *Jukebox) handleLogs(w http.ResponseWriter, r *http.Request) {
 		close(sub)
 	}()
 
-	for _, entry := range j.logs.GetEntries() {
-		fmt.Fprintf(w, "event: log\ndata: %s\n\n", mustMarshal(entry))
+	history := j.logs.GetEntries()
+	var lastSentID int64
+	for _, entry := range history {
+		writeLogEvent(w, entry)
+		lastSentID = entry.ID
 	}
 
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
 	}
 
-	for {
-		select {
-		case <-r.Context().Done():
-			return
-		case entry := <-sub:
-			fmt.Fprintf(w, "event: log\ndata: %s\n\n", mustMarshal(entry))
-			if f, ok := w.(http.Flusher); ok {
-				f.Flush()
-			}
-		}
-	}
+	streamLiveLogs(r.Context(), w, sub, lastSentID)
 }
 
 func mustMarshal(v interface{}) string {
