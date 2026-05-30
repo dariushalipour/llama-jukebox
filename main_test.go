@@ -1163,3 +1163,218 @@ func containsArg(args []string, want string) bool {
 	}
 	return false
 }
+
+func TestRequestsEqual(t *testing.T) {
+	a := LoadRequest{
+		HFRepo:         "repo/model",
+		Context:        4096,
+		GPULayers:      32,
+		FlashAttention: true,
+		Parallel:       2,
+		Env:            map[string]string{"LLAMA_CACHE": "/tmp"},
+		Flags:          map[string]interface{}{"temp": 0.7},
+	}
+	b := LoadRequest{
+		HFRepo:         "repo/model",
+		Context:        4096,
+		GPULayers:      32,
+		FlashAttention: true,
+		Parallel:       2,
+		Env:            map[string]string{"LLAMA_CACHE": "/tmp"},
+		Flags:          map[string]interface{}{"temp": 0.7},
+	}
+
+	if !requestsEqual(a, b) {
+		t.Fatal("expected identical requests to be equal")
+	}
+
+	b.HFRepo = "other/model"
+	if requestsEqual(a, b) {
+		t.Fatal("expected different HFRepo to not be equal")
+	}
+
+	b.HFRepo = "repo/model"
+	b.Context = 2048
+	if requestsEqual(a, b) {
+		t.Fatal("expected different Context to not be equal")
+	}
+
+	b.Context = 4096
+	b.FlashAttention = false
+	if requestsEqual(a, b) {
+		t.Fatal("expected different FlashAttention to not be equal")
+	}
+
+	b.FlashAttention = true
+	b.Env = map[string]string{"LLAMA_CACHE": "/other"}
+	if requestsEqual(a, b) {
+		t.Fatal("expected different Env to not be equal")
+	}
+}
+
+func TestLoadSameModelNoOp(t *testing.T) {
+	j := newProcessTestJukebox(t)
+	req := LoadRequest{HFRepo: "repo/model"}
+
+	if err := j.Load(context.Background(), req); err != nil {
+		t.Fatalf("first load failed: %v", err)
+	}
+	waitForState(t, j, "running")
+
+	pidBefore := j.Status().PID
+
+	if err := j.Load(context.Background(), req); err != nil {
+		t.Fatalf("second load with same model should succeed, got: %v", err)
+	}
+
+	pidAfter := j.Status().PID
+	if pidBefore != pidAfter {
+		t.Fatalf("expected same process PID, got %d before and %d after", pidBefore, pidAfter)
+	}
+
+	if err := j.Offload(); err != nil {
+		t.Fatalf("offload failed: %v", err)
+	}
+	waitForState(t, j, "idle")
+}
+
+func TestLoadDifferentModelSwaps(t *testing.T) {
+	tmpDir := t.TempDir()
+	loadOrderFile := filepath.Join(tmpDir, "load-order.txt")
+	script := filepath.Join(tmpDir, "fake-llama.sh")
+	contents := "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"" + loadOrderFile + "\"\ntrap 'exit 0' TERM INT\nwhile :; do\n  sleep 1\ndone\n"
+	if err := os.WriteFile(script, []byte(contents), 0755); err != nil {
+		t.Fatalf("failed to write helper script: %v", err)
+	}
+
+	host, port := readyEndpoint(t)
+	j := NewJukebox(Config{
+		LlamaBinary:   script,
+		Workdir:       tmpDir,
+		LlamaHost:     host,
+		LlamaPort:     port,
+		LoadTimeout:   5,
+		LogBufferSize: 500,
+	})
+
+	if err := j.Load(context.Background(), LoadRequest{HFRepo: "repo/model1"}); err != nil {
+		t.Fatalf("first load failed: %v", err)
+	}
+	waitForState(t, j, "running")
+
+	if err := j.Load(context.Background(), LoadRequest{HFRepo: "repo/model2"}); err != nil {
+		t.Fatalf("second load with different model failed: %v", err)
+	}
+	waitForState(t, j, "running")
+
+	time.Sleep(100 * time.Millisecond)
+
+	data, err := os.ReadFile(loadOrderFile)
+	if err != nil {
+		t.Fatalf("failed to read load order file: %v", err)
+	}
+
+	lines := strings.TrimSpace(string(data))
+	lineSlice := strings.Split(lines, "\n")
+
+	var hfRepos []string
+	for i := 0; i < len(lineSlice)-1; i++ {
+		if lineSlice[i] == "-hf" {
+			hfRepos = append(hfRepos, lineSlice[i+1])
+		}
+	}
+
+	if len(hfRepos) < 2 {
+		t.Fatalf("expected at least 2 model loads, got %d: %v", len(hfRepos), hfRepos)
+	}
+
+	if hfRepos[0] != "repo/model1" {
+		t.Errorf("expected first load to be repo/model1, got %q", hfRepos[0])
+	}
+	if hfRepos[len(hfRepos)-1] != "repo/model2" {
+		t.Errorf("expected last load to be repo/model2, got %q", hfRepos[len(hfRepos)-1])
+	}
+
+	if err := j.Offload(); err != nil {
+		t.Fatalf("offload failed: %v", err)
+	}
+	waitForState(t, j, "idle")
+}
+
+func TestLoadDifferentParamsReloads(t *testing.T) {
+	tmpDir := t.TempDir()
+	script := writeBlockingProcessScript(t)
+
+	host, port := readyEndpoint(t)
+	j := NewJukebox(Config{
+		LlamaBinary:   script,
+		Workdir:       tmpDir,
+		LlamaHost:     host,
+		LlamaPort:     port,
+		LoadTimeout:   5,
+		AllowedFlags:  []string{"c"},
+		LogBufferSize: 500,
+	})
+
+	req := LoadRequest{HFRepo: "repo/model", Context: 2048}
+
+	if err := j.Load(context.Background(), req); err != nil {
+		t.Fatalf("first load failed: %v", err)
+	}
+	waitForState(t, j, "running")
+
+	pidBefore := j.Status().PID
+
+	req2 := LoadRequest{HFRepo: "repo/model", Context: 4096}
+	if err := j.Load(context.Background(), req2); err != nil {
+		t.Fatalf("second load with different params failed: %v", err)
+	}
+	waitForState(t, j, "running")
+
+	pidAfter := j.Status().PID
+	if pidBefore == pidAfter {
+		t.Fatal("expected different process PID after param change, got same PID")
+	}
+
+	if j.Status().Model.HFRepo != "repo/model" {
+		t.Fatalf("expected model to be repo/model, got %q", j.Status().Model.HFRepo)
+	}
+
+	if err := j.Offload(); err != nil {
+		t.Fatalf("offload failed: %v", err)
+	}
+	waitForState(t, j, "idle")
+}
+
+func TestHandleLoadSameModelRespondsSuccess(t *testing.T) {
+	j := newProcessTestJukebox(t)
+	req := LoadRequest{HFRepo: "repo/model"}
+
+	if err := j.Load(context.Background(), req); err != nil {
+		t.Fatalf("first load failed: %v", err)
+	}
+	waitForState(t, j, "running")
+
+	body := []byte(`{"hf_repo":"repo/model"}`)
+	httpReq := httptest.NewRequest(http.MethodPost, "/load", bytes.NewBuffer(body))
+	w := httptest.NewRecorder()
+
+	j.handleLoad(w, httpReq)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", w.Code)
+	}
+
+	var resp map[string]string
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if resp["status"] != "success" {
+		t.Fatalf("expected status success, got %q", resp["status"])
+	}
+
+	if err := j.Offload(); err != nil {
+		t.Fatalf("offload failed: %v", err)
+	}
+	waitForState(t, j, "idle")
+}

@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"syscall"
@@ -64,6 +65,16 @@ type ErrConflict struct {
 
 func (e ErrConflict) Error() string { return e.msg }
 
+func requestsEqual(a, b LoadRequest) bool {
+	return a.HFRepo == b.HFRepo &&
+		a.Context == b.Context &&
+		a.GPULayers == b.GPULayers &&
+		a.FlashAttention == b.FlashAttention &&
+		a.Parallel == b.Parallel &&
+		reflect.DeepEqual(a.Env, b.Env) &&
+		reflect.DeepEqual(a.Flags, b.Flags)
+}
+
 type LogBuffer struct {
 	mu      sync.RWMutex
 	entries []LogEntry
@@ -113,6 +124,7 @@ type Jukebox struct {
 
 	cmd        *exec.Cmd
 	currentMod *ModelStatus
+	currentReq LoadRequest
 	loading    bool
 	stopping   bool
 
@@ -184,8 +196,7 @@ func (j *Jukebox) monitorProcess(cmd *exec.Cmd, done chan struct{}) {
 	if j.cmd == cmd {
 		j.cmd = nil
 		j.currentMod = nil
-		j.loading = false
-		j.stopping = false
+		j.currentReq = LoadRequest{}
 		j.offloadSig = nil
 		j.processDone = nil
 	}
@@ -216,6 +227,9 @@ func (j *Jukebox) Offload() error {
 		_ = cmd.Process.Signal(syscall.SIGTERM)
 	}
 	if doneCh == nil {
+		j.mu.Lock()
+		j.stopping = false
+		j.mu.Unlock()
 		return nil
 	}
 
@@ -229,12 +243,60 @@ func (j *Jukebox) Offload() error {
 		<-doneCh
 	}
 
+	j.mu.Lock()
+	j.stopping = false
+	j.mu.Unlock()
 	return nil
 }
 
 func (j *Jukebox) Load(ctx context.Context, req LoadRequest) error {
 	if err := j.validateRequest(req); err != nil {
 		return err
+	}
+
+	j.mu.Lock()
+	defer j.mu.Unlock()
+
+	if j.loading || j.stopping {
+		return ErrConflict{"a model is already running; offload it first"}
+	}
+	if j.cmd != nil && j.cmd.Process != nil && requestsEqual(req, j.currentReq) {
+		return nil
+	}
+
+	j.loading = true
+	defer func() { j.loading = false }()
+
+	// Offload existing process, if any
+	if j.cmd != nil && j.cmd.Process != nil {
+		oldCmd := j.cmd
+		oldOffloadCh := j.offloadSig
+
+		j.cmd = nil
+		j.currentMod = nil
+		j.currentReq = LoadRequest{}
+		j.offloadSig = nil
+		j.processDone = nil
+
+		if oldOffloadCh != nil {
+			close(oldOffloadCh)
+		}
+		_ = oldCmd.Process.Signal(syscall.SIGTERM)
+
+		done := make(chan struct{})
+		go func() {
+			_ = oldCmd.Wait()
+			close(done)
+		}()
+
+		timer := time.NewTimer(5 * time.Second)
+		select {
+		case <-done:
+			timer.Stop()
+		case <-timer.C:
+			_ = oldCmd.Process.Signal(syscall.SIGKILL)
+			<-done
+		}
 	}
 
 	args := []string{"-hf", req.HFRepo}
@@ -284,15 +346,7 @@ func (j *Jukebox) Load(ctx context.Context, req LoadRequest) error {
 		return err
 	}
 
-	j.mu.Lock()
-	if j.loading || j.stopping || (j.cmd != nil && j.cmd.Process != nil) {
-		j.mu.Unlock()
-		return ErrConflict{"a model is already running; offload it first"}
-	}
-	j.loading = true
 	if err := cmd.Start(); err != nil {
-		j.loading = false
-		j.mu.Unlock()
 		return fmt.Errorf("failed to start llama-server: %v", err)
 	}
 
@@ -301,17 +355,21 @@ func (j *Jukebox) Load(ctx context.Context, req LoadRequest) error {
 	j.offloadSig = offloadCh
 	j.processDone = doneCh
 	j.cmd = cmd
+	j.currentReq = req
 	j.currentMod = &ModelStatus{HFRepo: req.HFRepo, StartedAt: time.Now()}
-	j.loading = false
-	j.stopping = false
-	j.mu.Unlock()
 
 	go j.monitorProcess(cmd, doneCh)
 	go j.streamLogs(stdout, "stdout")
 	go j.streamLogs(stderr, "stderr")
 
-	if err := j.waitForReady(ctx, offloadCh, doneCh); err != nil {
+	j.mu.Unlock()
+	err = j.waitForReady(ctx, offloadCh, doneCh)
+	if err != nil {
 		_ = j.Offload()
+	}
+	j.mu.Lock()
+
+	if err != nil {
 		return fmt.Errorf("model failed to reach ready state: %v", err)
 	}
 
