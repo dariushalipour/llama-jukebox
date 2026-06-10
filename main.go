@@ -421,7 +421,7 @@ func (j *Jukebox) validateRequest(req LoadRequest) error {
 		}
 	}
 
-	for k, v := range req.Flags {
+	for k := range req.Flags {
 		allowed := false
 		for _, a := range j.config.AllowedFlags {
 			if a == k {
@@ -431,9 +431,6 @@ func (j *Jukebox) validateRequest(req LoadRequest) error {
 		}
 		if !allowed {
 			return fmt.Errorf("flag %s is not whitelisted", k)
-		}
-		if strVal, ok := v.(string); ok && !isSafe(strVal) {
-			return fmt.Errorf("unsafe value for flag %s", k)
 		}
 	}
 
