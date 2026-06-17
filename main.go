@@ -270,6 +270,7 @@ func (j *Jukebox) Load(ctx context.Context, req LoadRequest) error {
 	if j.cmd != nil && j.cmd.Process != nil {
 		oldCmd := j.cmd
 		oldOffloadCh := j.offloadSig
+		oldDone := j.processDone
 
 		j.cmd = nil
 		j.currentMod = nil
@@ -282,19 +283,15 @@ func (j *Jukebox) Load(ctx context.Context, req LoadRequest) error {
 		}
 		_ = terminateProcess(oldCmd.Process)
 
-		done := make(chan struct{})
-		go func() {
-			_ = oldCmd.Wait()
-			close(done)
-		}()
-
-		timer := time.NewTimer(5 * time.Second)
-		select {
-		case <-done:
-			timer.Stop()
-		case <-timer.C:
-			_ = killProcess(oldCmd.Process)
-			<-done
+		if oldDone != nil {
+			timer := time.NewTimer(5 * time.Second)
+			select {
+			case <-oldDone:
+				timer.Stop()
+			case <-timer.C:
+				_ = killProcess(oldCmd.Process)
+				<-oldDone
+			}
 		}
 	}
 
@@ -357,22 +354,78 @@ func (j *Jukebox) Load(ctx context.Context, req LoadRequest) error {
 	j.currentReq = req
 	j.currentMod = &ModelStatus{HFRepo: req.HFRepo, StartedAt: time.Now()}
 
+	var logsDone sync.WaitGroup
+	logsDone.Add(2)
+
 	go j.monitorProcess(cmd, doneCh)
-	go j.streamLogs(stdout, "stdout")
-	go j.streamLogs(stderr, "stderr")
+	go func() { defer logsDone.Done(); j.streamLogs(stdout, "stdout") }()
+	go func() { defer logsDone.Done(); j.streamLogs(stderr, "stderr") }()
 
 	j.mu.Unlock()
 	err = j.waitForReady(ctx, offloadCh, doneCh)
 	if err != nil {
 		_ = j.Offload()
 	}
+
+	var diag string
+	if err != nil && strings.Contains(err.Error(), "exited before becoming ready") {
+		diag = j.exitDiagnostics(cmd, &logsDone)
+	}
+
 	j.mu.Lock()
 
 	if err != nil {
+		if diag != "" {
+			return fmt.Errorf("model failed to reach ready state: %v; %s", err, diag)
+		}
 		return fmt.Errorf("model failed to reach ready state: %v", err)
 	}
 
 	return nil
+}
+
+func (j *Jukebox) exitDiagnostics(cmd *exec.Cmd, logsDone *sync.WaitGroup) string {
+	drained := make(chan struct{})
+	go func() { logsDone.Wait(); close(drained) }()
+	select {
+	case <-drained:
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	var parts []string
+	if cmd != nil && cmd.ProcessState != nil {
+		code := cmd.ProcessState.ExitCode()
+		parts = append(parts, fmt.Sprintf("exit code %d%s", code, exitHint(code)))
+	}
+	if tail := j.recentLogTail(20); tail != "" {
+		parts = append(parts, "recent llama-server output:\n"+tail)
+	}
+	return strings.Join(parts, "; ")
+}
+
+func (j *Jukebox) recentLogTail(n int) string {
+	entries := j.logs.GetEntries()
+	if len(entries) > n {
+		entries = entries[len(entries)-n:]
+	}
+	lines := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.Line == "" {
+			continue
+		}
+		lines = append(lines, e.Line)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func exitHint(code int) string {
+	switch uint32(code) {
+	case 0xC0000135:
+		return " (a required DLL was not found; ensure llama-server's runtime dependencies, e.g. CUDA DLLs, are on PATH in the daemon's environment)"
+	case 0xC000007B:
+		return " (bad image / architecture mismatch between llama-server.exe and its DLLs)"
+	}
+	return ""
 }
 
 func (j *Jukebox) isAllowedFlag(flag string) bool {

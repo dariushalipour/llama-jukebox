@@ -592,6 +592,33 @@ func newExitBeforeReadyTestJukebox(t *testing.T) *Jukebox {
 	return NewJukebox(cfg)
 }
 
+func writeFailingProcessScript(t *testing.T, stderrLine string, exitCode int) string {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "failing-llama.sh")
+	script := "#!/bin/sh\necho '" + stderrLine + "' 1>&2\nexit " + strconv.Itoa(exitCode) + "\n"
+	if err := os.WriteFile(path, []byte(script), 0755); err != nil {
+		t.Fatalf("failed to write helper script: %v", err)
+	}
+	return path
+}
+
+func newFailingExitTestJukebox(t *testing.T, stderrLine string, exitCode int) *Jukebox {
+	t.Helper()
+
+	host, port := readyEndpoint(t)
+	cfg := Config{
+		LlamaBinary:   writeFailingProcessScript(t, stderrLine, exitCode),
+		Workdir:       t.TempDir(),
+		LlamaHost:     host,
+		LlamaPort:     port,
+		ListenAddr:    ":4468",
+		LoadTimeout:   30,
+		LogBufferSize: 500,
+	}
+	return NewJukebox(cfg)
+}
+
 func waitForState(t *testing.T, j *Jukebox, want string) {
 	t.Helper()
 
@@ -898,6 +925,24 @@ func TestLoadFailsFastWhenProcessExitsBeforeReady(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed >= 2*time.Second {
 		t.Fatalf("expected early-exit failure before readiness polling timeout, got %v", elapsed)
+	}
+
+	waitForState(t, j, "idle")
+}
+
+func TestLoadSurfacesExitCodeAndOutputWhenProcessExitsBeforeReady(t *testing.T) {
+	j := newFailingExitTestJukebox(t, "fatal: could not load model", 3)
+
+	err := j.Load(context.Background(), LoadRequest{HFRepo: "repo/model"})
+	if err == nil {
+		t.Fatal("expected load to fail when process exits before readiness")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "exit code 3") {
+		t.Fatalf("expected exit code in error, got %v", err)
+	}
+	if !strings.Contains(msg, "fatal: could not load model") {
+		t.Fatalf("expected captured stderr in error, got %v", err)
 	}
 
 	waitForState(t, j, "idle")
