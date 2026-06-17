@@ -54,6 +54,8 @@ LLAMA_JUKEBOX_CONFIG=/etc/llama-jukebox/config.json ./llama-jukebox init
 
 This creates the config file (and any parent directories) with sensible defaults. Edit it with your `llama-server` binary path, network settings, and allowed flags.
 
+> **Windows paths**: The config is identical on Windows except for `llama_binary` (point it at `llama-server.exe`) and `workdir`. In JSON, use forward slashes (`"C:/path/to/llama-server.exe"`) or escaped backslashes (`"C:\\path\\to\\llama-server.exe"`) — a single backslash is invalid JSON.
+
 ### Run
 ```bash
 # Config path is required via LLAMA_JUKEBOX_CONFIG:

@@ -15,7 +15,6 @@ import (
 	"reflect"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 	"unicode"
 )
@@ -224,7 +223,7 @@ func (j *Jukebox) Offload() error {
 		close(offloadCh)
 	}
 	if !alreadyStopping {
-		_ = cmd.Process.Signal(syscall.SIGTERM)
+		_ = terminateProcess(cmd.Process)
 	}
 	if doneCh == nil {
 		j.mu.Lock()
@@ -239,7 +238,7 @@ func (j *Jukebox) Offload() error {
 	select {
 	case <-doneCh:
 	case <-timer.C:
-		_ = cmd.Process.Signal(syscall.SIGKILL)
+		_ = killProcess(cmd.Process)
 		<-doneCh
 	}
 
@@ -281,7 +280,7 @@ func (j *Jukebox) Load(ctx context.Context, req LoadRequest) error {
 		if oldOffloadCh != nil {
 			close(oldOffloadCh)
 		}
-		_ = oldCmd.Process.Signal(syscall.SIGTERM)
+		_ = terminateProcess(oldCmd.Process)
 
 		done := make(chan struct{})
 		go func() {
@@ -294,7 +293,7 @@ func (j *Jukebox) Load(ctx context.Context, req LoadRequest) error {
 		case <-done:
 			timer.Stop()
 		case <-timer.C:
-			_ = oldCmd.Process.Signal(syscall.SIGKILL)
+			_ = killProcess(oldCmd.Process)
 			<-done
 		}
 	}
@@ -421,7 +420,7 @@ func (j *Jukebox) validateRequest(req LoadRequest) error {
 		}
 	}
 
-	for k := range req.Flags {
+	for k, v := range req.Flags {
 		allowed := false
 		for _, a := range j.config.AllowedFlags {
 			if a == k {
@@ -431,6 +430,9 @@ func (j *Jukebox) validateRequest(req LoadRequest) error {
 		}
 		if !allowed {
 			return fmt.Errorf("flag %s is not whitelisted", k)
+		}
+		if s, ok := v.(string); ok && !isSafe(s) {
+			return fmt.Errorf("unsafe value for flag %s", k)
 		}
 	}
 
@@ -693,7 +695,7 @@ func main() {
 	}
 
 	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	signal.Notify(stop, shutdownSignals()...)
 
 	go func() {
 		log.Printf("llama-jukebox starting on %s...", cfg.ListenAddr)
